@@ -77,7 +77,6 @@
 struct bcm2835_pinctrl {
 	struct device *dev;
 	void __iomem *base;
-	int irq[BCM2835_NUM_IRQS];
 	int *wake_irq;
 
 	/* note: locking assumes each bank will have its own unsigned long */
@@ -376,7 +375,7 @@ static const struct gpio_chip bcm2711_gpio_chip = {
 	.get = bcm2835_gpio_get,
 	.set = bcm2835_gpio_set,
 	.set_config = gpiochip_generic_config,
-	.base = -1,
+	.base = 0,
 	.ngpio = BCM2711_NUM_GPIOS,
 	.can_sleep = false,
 };
@@ -407,14 +406,14 @@ static void bcm2835_gpio_irq_handler(struct irq_desc *desc)
 	int group;
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(pc->irq); i++) {
-		if (pc->irq[i] == irq) {
+	for (i = 0; i < BCM2835_NUM_IRQS; i++) {
+		if (chip->irq.parents[i] == irq) {
 			group = i;
 			break;
 		}
 	}
 	/* This should not happen, every IRQ has a bank */
-	if (i == ARRAY_SIZE(pc->irq))
+	if (i == BCM2835_NUM_IRQS)
 		BUG();
 
 	chained_irq_enter(host_chip, desc);
@@ -1185,6 +1184,7 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	const struct bcm_plat_data *pdata;
 	struct bcm2835_pinctrl *pc;
+	struct gpio_irq_chip *girq;
 	struct resource iomem;
 	int err, i;
 	const struct of_device_id *match;
@@ -1287,18 +1287,13 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 		char *name;
 
 		girq->parents[i] = irq_of_parse_and_map(np, i);
-
-		if (girq->parents[i] == 0)
-			continue;
-
 		if (!is_7211) {
-			gpiochip_set_chained_irqchip(&pc->gpio_chip,
-					     &bcm2835_gpio_irq_chip,
-					     pc->irq[i],
-					     bcm2835_gpio_irq_handler);
+			if (!girq->parents[i]) {
+				girq->num_parents = i;
+				break;
+			}
 			continue;
 		}
-
 		/* Skip over the all banks interrupts */
 		pc->wake_irq[i] = irq_of_parse_and_map(np, i +
 						       BCM2835_NUM_IRQS + 1);
@@ -1324,7 +1319,7 @@ static int bcm2835_pinctrl_probe(struct platform_device *pdev)
 	girq->default_type = IRQ_TYPE_NONE;
 	girq->handler = handle_level_irq;
 
-	err = gpiochip_add_data(&pc->gpio_chip, pc);
+	err = devm_gpiochip_add_data(dev, &pc->gpio_chip, pc);
 	if (err) {
 		dev_err(dev, "could not add GPIO chip\n");
 		goto out_remove;
