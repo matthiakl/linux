@@ -574,7 +574,6 @@ static void tcf_ct_flow_tables_uninit(void)
 }
 
 static struct tc_action_ops act_ct_ops;
-static unsigned int ct_net_id;
 
 struct tc_ct_action_net {
 	struct tc_action_net tn; /* Must be first */
@@ -1184,7 +1183,7 @@ static int tcf_ct_fill_params(struct net *net,
 			      struct nlattr **tb,
 			      struct netlink_ext_ack *extack)
 {
-	struct tc_ct_action_net *tn = net_generic(net, ct_net_id);
+	struct tc_ct_action_net *tn = net_generic(net, act_ct_ops.net_id);
 	struct nf_conntrack_zone zone;
 	struct nf_conn *tmpl;
 	int err;
@@ -1259,7 +1258,7 @@ static int tcf_ct_init(struct net *net, struct nlattr *nla,
 		       struct tcf_proto *tp, u32 flags,
 		       struct netlink_ext_ack *extack)
 {
-	struct tc_action_net *tn = net_generic(net, ct_net_id);
+	struct tc_action_net *tn = net_generic(net, act_ct_ops.net_id);
 	bool bind = flags & TCA_ACT_FLAGS_BIND;
 	struct tcf_ct_params *params = NULL;
 	struct nlattr *tb[TCA_CT_MAX + 1];
@@ -1272,6 +1271,12 @@ static int tcf_ct_init(struct net *net, struct nlattr *nla,
 	if (!nla) {
 		NL_SET_ERR_MSG_MOD(extack, "Ct requires attributes to be passed");
 		return -EINVAL;
+	}
+
+	if (bind && !(flags & TCA_ACT_FLAGS_AT_INGRESS_OR_CLSACT)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Attaching ct to a non ingress/clsact qdisc is unsupported");
+		return -EOPNOTSUPP;
 	}
 
 	err = nla_parse_nested(tb, TCA_CT_MAX, nla, ct_policy, extack);
@@ -1495,14 +1500,14 @@ static int tcf_ct_walker(struct net *net, struct sk_buff *skb,
 			 const struct tc_action_ops *ops,
 			 struct netlink_ext_ack *extack)
 {
-	struct tc_action_net *tn = net_generic(net, ct_net_id);
+	struct tc_action_net *tn = net_generic(net, act_ct_ops.net_id);
 
 	return tcf_generic_walker(tn, skb, cb, type, ops, extack);
 }
 
 static int tcf_ct_search(struct net *net, struct tc_action **a, u32 index)
 {
-	struct tc_action_net *tn = net_generic(net, ct_net_id);
+	struct tc_action_net *tn = net_generic(net, act_ct_ops.net_id);
 
 	return tcf_idr_search(tn, a, index);
 }
@@ -1533,7 +1538,7 @@ static struct tc_action_ops act_ct_ops = {
 static __net_init int ct_init_net(struct net *net)
 {
 	unsigned int n_bits = sizeof_field(struct tcf_ct_params, labels) * 8;
-	struct tc_ct_action_net *tn = net_generic(net, ct_net_id);
+	struct tc_ct_action_net *tn = net_generic(net, act_ct_ops.net_id);
 
 	if (nf_connlabels_get(net, n_bits - 1)) {
 		tn->labels = false;
@@ -1551,20 +1556,20 @@ static void __net_exit ct_exit_net(struct list_head *net_list)
 
 	rtnl_lock();
 	list_for_each_entry(net, net_list, exit_list) {
-		struct tc_ct_action_net *tn = net_generic(net, ct_net_id);
+		struct tc_ct_action_net *tn = net_generic(net, act_ct_ops.net_id);
 
 		if (tn->labels)
 			nf_connlabels_put(net);
 	}
 	rtnl_unlock();
 
-	tc_action_net_exit(net_list, ct_net_id);
+	tc_action_net_exit(net_list, act_ct_ops.net_id);
 }
 
 static struct pernet_operations ct_net_ops = {
 	.init = ct_init_net,
 	.exit_batch = ct_exit_net,
-	.id   = &ct_net_id,
+	.id   = &act_ct_ops.net_id,
 	.size = sizeof(struct tc_ct_action_net),
 };
 
