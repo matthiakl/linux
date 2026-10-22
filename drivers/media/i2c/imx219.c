@@ -47,26 +47,8 @@
 
 #define IMX219_DEFAULT_LINK_FREQ	456000000
 
-/* V_TIMING internal */
-#define IMX219_REG_VTS			0x0160
-#define IMX219_VTS_15FPS		0x0dc6
-#define IMX219_VTS_30FPS_1080P		0x06e3
-#define IMX219_VTS_30FPS_BINNED		0x06e3
-#define IMX219_VTS_30FPS_640x480	0x06e3
-#define IMX219_VTS_MAX			0xffff
-
-#define IMX219_VBLANK_MIN		32
-
-/*Frame Length Line*/
-#define IMX219_FLL_MIN			0x08a6
-#define IMX219_FLL_MAX			0xffff
-#define IMX219_FLL_STEP			1
-#define IMX219_FLL_DEFAULT		0x0c98
-
-/* HBLANK control range */
-#define IMX219_PPL_MIN			3448
-#define IMX219_PPL_MAX			0x7ff0
-#define IMX219_REG_HTS			0x0162
+/* HBLANK control - read only */
+#define IMX219_PPL_DEFAULT		3448
 
 /* Exposure control */
 #define IMX219_REG_EXPOSURE		0x015a
@@ -88,6 +70,11 @@
 #define IMX219_DGTL_GAIN_MAX		0x0fff
 #define IMX219_DGTL_GAIN_DEFAULT	0x0100
 #define IMX219_DGTL_GAIN_STEP		1
+
+/* V_TIMING internal */
+#define IMX219_REG_FRM_LENGTH_A		0x0160
+#define IMX219_FLL_MAX			0xfffe
+#define IMX219_VBLANK_MIN		32
 
 #define IMX219_REG_ORIENTATION		0x0172
 
@@ -157,7 +144,7 @@ struct imx219_mode {
 	struct v4l2_rect crop;
 
 	/* V-timing */
-	unsigned int vts_def;
+	unsigned int fll_def;
 
 	/* Default register values */
 	struct imx219_reg_list reg_list;
@@ -399,7 +386,7 @@ static const struct imx219_mode supported_modes[] = {
 			.width = 3280,
 			.height = 2464
 		},
-		.vts_def = IMX219_VTS_15FPS,
+		.fll_def = 3526,
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_3280x2464_regs),
 			.regs = mode_3280x2464_regs,
@@ -417,7 +404,7 @@ static const struct imx219_mode supported_modes[] = {
 			.width = 1920,
 			.height = 1080
 		},
-		.vts_def = IMX219_VTS_30FPS_1080P,
+		.fll_def = 1763,
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_1920_1080_regs),
 			.regs = mode_1920_1080_regs,
@@ -435,7 +422,7 @@ static const struct imx219_mode supported_modes[] = {
 			.width = 3280,
 			.height = 2464
 		},
-		.vts_def = IMX219_VTS_30FPS_BINNED,
+		.fll_def = 1763,
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_1640_1232_regs),
 			.regs = mode_1640_1232_regs,
@@ -453,7 +440,7 @@ static const struct imx219_mode supported_modes[] = {
 			.width = 1280,
 			.height = 960
 		},
-		.vts_def = IMX219_VTS_30FPS_640x480,
+		.fll_def = 1763,
 		.reg_list = {
 			.num_of_regs = ARRAY_SIZE(mode_640_480_regs),
 			.regs = mode_640_480_regs,
@@ -705,7 +692,7 @@ static int imx219_set_ctrl(struct v4l2_ctrl *ctrl)
 				       imx219->vflip->val << 1);
 		break;
 	case V4L2_CID_VBLANK:
-		ret = imx219_write_reg(imx219, IMX219_REG_VTS,
+		ret = imx219_write_reg(imx219, IMX219_REG_FRM_LENGTH_A,
 				       IMX219_REG_VALUE_16BIT,
 				       (imx219->mode->height + ctrl->val) /
 						imx219->mode->rate_factor);
@@ -903,73 +890,40 @@ static int imx219_set_pad_format(struct v4l2_subdev *sd,
 		/* Bayer order varies with flips */
 		fmt->format.code = imx219_get_format_code(imx219, codes[i]);
 
-		mode = v4l2_find_nearest_size(supported_modes,
-					      ARRAY_SIZE(supported_modes),
-					      width, height,
-					      fmt->format.width,
-					      fmt->format.height);
-		imx219_update_image_pad_format(imx219, mode, fmt);
-		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
-							      fmt->pad);
-			*framefmt = fmt->format;
-		} else if (imx219->mode != mode ||
-			imx219->fmt.code != fmt->format.code) {
-			u32 prev_hts = imx219->mode->width + imx219->hblank->val;
-
-			imx219->fmt = fmt->format;
-			imx219->mode = mode;
-			/* Update limits and set FPS to default */
-			__v4l2_ctrl_modify_range(imx219->vblank,
-						 IMX219_VBLANK_MIN,
-						 IMX219_VTS_MAX - mode->height,
-						 1,
-						 mode->vts_def - mode->height);
-			__v4l2_ctrl_s_ctrl(imx219->vblank,
-					   mode->vts_def - mode->height);
-			/*
-			 * Update max exposure while meeting
-			 * expected vblanking
-			 */
-			exposure_max = mode->vts_def - 4;
-			exposure_def =
-				(exposure_max < IMX219_EXPOSURE_DEFAULT) ?
-					exposure_max : IMX219_EXPOSURE_DEFAULT;
-			__v4l2_ctrl_modify_range(imx219->exposure,
-						 imx219->exposure->minimum,
-						 exposure_max,
-						 imx219->exposure->step,
-						 exposure_def);
-			/*
-			 * Retain PPL setting from previous mode so that the
-			 * line time does not change on a mode change.
-			 * Limits have to be recomputed as the controls define
-			 * the blanking only, so PPL values need to have the
-			 * mode width subtracted.
-			 */
-			hblank = prev_hts - mode->width;
-			__v4l2_ctrl_modify_range(imx219->hblank,
-						 IMX219_PPL_MIN - mode->width,
-						 IMX219_PPL_MAX - mode->width,
-						 1,
-						 IMX219_PPL_MIN - mode->width);
-			__v4l2_ctrl_s_ctrl(imx219->hblank, hblank);
-
-			/* Scale the pixel rate based on the mode specific factor */
-			pixel_rate =
-				IMX219_PIXEL_RATE * imx219->mode->rate_factor;
-			__v4l2_ctrl_modify_range(imx219->pixel_rate, pixel_rate,
-						 pixel_rate, 1, pixel_rate);
-		}
-	} else {
-		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
-							      fmt->pad);
-			*framefmt = fmt->format;
-		} else {
-			/* Only one embedded data mode is supported */
-			imx219_update_metadata_pad_format(fmt);
-		}
+	mode = v4l2_find_nearest_size(supported_modes,
+				      ARRAY_SIZE(supported_modes),
+				      width, height,
+				      fmt->format.width, fmt->format.height);
+	imx219_update_pad_format(imx219, mode, fmt);
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		framefmt = v4l2_subdev_get_try_format(sd, sd_state, fmt->pad);
+		*framefmt = fmt->format;
+	} else if (imx219->mode != mode ||
+		   imx219->fmt.code != fmt->format.code) {
+		imx219->fmt = fmt->format;
+		imx219->mode = mode;
+		/* Update limits and set FPS to default */
+		__v4l2_ctrl_modify_range(imx219->vblank, IMX219_VBLANK_MIN,
+					 IMX219_FLL_MAX - mode->height, 1,
+					 mode->fll_def - mode->height);
+		__v4l2_ctrl_s_ctrl(imx219->vblank,
+				   mode->fll_def - mode->height);
+		/* Update max exposure while meeting expected vblanking */
+		exposure_max = mode->fll_def - 4;
+		exposure_def = (exposure_max < IMX219_EXPOSURE_DEFAULT) ?
+			exposure_max : IMX219_EXPOSURE_DEFAULT;
+		__v4l2_ctrl_modify_range(imx219->exposure,
+					 imx219->exposure->minimum,
+					 exposure_max, imx219->exposure->step,
+					 exposure_def);
+		/*
+		 * Currently PPL is fixed to IMX219_PPL_DEFAULT, so hblank
+		 * depends on mode->width only, and is not changeble in any
+		 * way other than changing the mode.
+		 */
+		hblank = IMX219_PPL_DEFAULT - mode->width;
+		__v4l2_ctrl_modify_range(imx219->hblank, hblank, hblank, 1,
+					 hblank);
 	}
 
 	mutex_unlock(&imx219->mutex);
@@ -1369,15 +1323,15 @@ static int imx219_init_controls(struct imx219 *imx219)
 	/* Initial vblank/hblank/exposure parameters based on current mode */
 	imx219->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
 					   V4L2_CID_VBLANK, IMX219_VBLANK_MIN,
-					   IMX219_VTS_MAX - height, 1,
-					   imx219->mode->vts_def - height);
+					   IMX219_FLL_MAX - height, 1,
+					   imx219->mode->fll_def - height);
 	hblank = IMX219_PPL_MIN - imx219->mode->width;
 	imx219->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
 					   V4L2_CID_HBLANK, hblank,
 					   IMX219_PPL_MAX - imx219->mode->width,
 					   1, hblank);
 
-	exposure_max = imx219->mode->vts_def - 4;
+	exposure_max = imx219->mode->fll_def - 4;
 	exposure_def = (exposure_max < IMX219_EXPOSURE_DEFAULT) ?
 		exposure_max : IMX219_EXPOSURE_DEFAULT;
 	imx219->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx219_ctrl_ops,
@@ -1543,6 +1497,9 @@ static int imx219_probe(struct i2c_client *client)
 	/* Request optional enable pin */
 	imx219->reset_gpio = devm_gpiod_get_optional(dev, "reset",
 						     GPIOD_OUT_HIGH);
+	if (IS_ERR(imx219->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(imx219->reset_gpio),
+				     "failed to get reset gpio\n");
 
 	/*
 	 * The sensor must be powered for imx219_identify_module()
